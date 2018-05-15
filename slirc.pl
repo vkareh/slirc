@@ -22,6 +22,11 @@
 #
 # Then run ./slirc.pl <config-file>. Connect to the chosen port on
 # 127.0.0.1 with your chosen password.
+#
+# Updated 2018-05-15 to add support for listening on Unix domain sockets
+# by Colin Watson <cjwatson@chiark.greenend.org.uk>. To use this feature
+# with an IRC client supporting Unix domain connections, add the line
+# "unix_socket=<path>" to the config file.
 
 use strict;
 use warnings;
@@ -36,7 +41,7 @@ use Data::Dumper;
 use Digest::SHA qw(sha256);
 use JSON;
 
-my $VERSION = "20171127";
+my $VERSION = "20180515";
 my $start_time = time();
 my %config;
 
@@ -240,9 +245,11 @@ sub irc_broadcast_away {
 sub irc_check_welcome {
     my $c = shift;
 
-    if (defined $c->{Nick} && defined $c->{User} && defined $c->{Password} &&
+    if (defined $c->{Nick} && defined $c->{User} &&
+	(!$config{password} || defined $c->{Password}) &&
 	!$c->{Authed}) {
-	if (sha256($c->{Password}) eq sha256($config{password})) {
+	if (!$config{password} ||
+	    sha256($c->{Password}) eq sha256($config{password})) {
 	    $c->{Authed} = 1;
 	} else {
 	    irc_server_notice $c, "Incorrect password";
@@ -904,7 +911,9 @@ sub irc_line {
 
 sub irc_listen {
     print "Start IRC listener\n";
-    tcp_server "127.0.0.1", ($config{port} || 6667), sub {
+    my $listen_host = $config{unix_socket} ? "unix/" : "127.0.0.1";
+    tcp_server $listen_host,
+	       ($config{unix_socket} || $config{port} || 6667), sub {
 	my ($fd, $host, $port) = @_;
 
 	my $fh;
@@ -929,6 +938,8 @@ sub irc_listen {
 	$fh->push_read(line => sub { irc_line($c, @_) });
 
 	irc_server_notice $c, "Waiting for RTM connection" if not $connected;
+    }, sub {
+	chmod 0600, $config{unix_socket} if $config{unix_socket};
     }
 }
 
