@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # slirc.pl: local Slack IRC gateway
-# Copyright (C) 2017 Daniel Beer <dlbeer@gmail.com>
+# Copyright (C) 2017-2019 Daniel Beer <dlbeer@gmail.com>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -27,6 +27,17 @@
 # by Colin Watson <cjwatson@chiark.greenend.org.uk>. To use this feature
 # with an IRC client supporting Unix domain connections, add the line
 # "unix_socket=<path>" to the config file.
+#
+# Updated 2019-02-18:
+# - HTML entities are now escaped/unescaped properly
+# - Channel IDs are translated with the correct sigil
+# - You can now close accumulated group chats. This is mapped to
+#   JOIN/PART (the behaviour of JOIN/PART for public channels is
+#   unaffected)
+# - IRC-side PING checks are now more lenient, to work around bugs in
+#   some IRC clients
+# - Added X commands for debug dumps and dynamically switching protocol
+#   debug on/off
 
 use strict;
 use warnings;
@@ -38,19 +49,22 @@ use AnyEvent::Socket;
 use AnyEvent::WebSocket::Client;
 use URI::Encode qw(uri_encode);
 use Data::Dumper;
+use Time::localtime;
 use Digest::SHA qw(sha256);
 use JSON;
 
-my $VERSION = "20180515";
+my $VERSION = "20190225";
 my $start_time = time();
 my %config;
+
+$| = 1;
 
 ########################################################################
 # Global chat state
 ########################################################################
 
 my $connected;			# Is the RTM connection ready?
-my $self_id;			# Slack ID of our own user, or undef if not connected
+my $self_id;			# Slack ID of our own user, or undef
 
 my %channels;			# Slack ID -> channel hash ref
 my %channels_by_name;		# irc_lcase -> channel hash ref
@@ -123,6 +137,8 @@ sub rtm_send_to_user;
 sub rtm_apicall;
 sub rtm_download;
 sub rtm_destroy;
+sub rtm_update_join;
+sub rtm_update_part;
 
 my %irc_clients;
 
@@ -148,7 +164,7 @@ sub irc_send_args {
     }
 
     my $line = join(' ', @arg);
-    print "IRC $c->{Handle} SEND: $line\n";
+    print "IRC $c->{Handle} SEND: $line\n" if $config{debug_dump};
     $c->{Handle}->push_write("$line\r\n");
 }
 
@@ -242,6 +258,25 @@ sub irc_broadcast_away {
     }
 }
 
+sub irc_send_motd {
+    my $c = shift;
+    my @banner =
+      (
+       '     _ _                  _',
+       ' ___| (_)_ __ ___   _ __ | |',
+       '/ __| | | \'__/ __| | \'_ \| |',
+       '\__ \ | | | | (__ _| |_) | |',
+       '|___/_|_|_|  \___(_) .__/|_|',
+       '                   |_|',
+       'slirc.pl, Copyright (C) 2017-2019 Daniel Beer <dlbeer@gmail.com>'
+      );
+
+    for my $x (@banner) {
+	irc_send_num $c, 372, [], $x;
+    }
+    irc_send_num $c, 376, [], "End of /MOTD command";
+}
+
 sub irc_check_welcome {
     my $c = shift;
 
@@ -267,10 +302,12 @@ sub irc_check_welcome {
 	return;
     }
 
-    irc_send_num $c, 001, [], "slirc.pl version $VERSION";
-    irc_send_num $c, 002, [],
-      "Copyright (C) 2017 Daniel Beer <dlbeer\@gmail.com>";
-    irc_send_num $c, 003, [], `uptime`;
+    my $lt = localtime($start_time);
+
+    irc_send_num $c, 001, [], "slirc.pl IRC-to-Slack gateway";
+    irc_send_num $c, 002, [], "This is slirc.pl version $VERSION";
+    irc_send_num $c, 003, [], "Server started " . ctime($start_time);
+    irc_send_motd $c;
     $c->{Ready} = 1;
 
     my $user = $users{$self_id};
@@ -381,6 +418,24 @@ sub irc_invite_or_kick {
 }
 
 my %gateway_command = (
+    "debug_dump_state" => sub {
+	my $c = shift;
+	irc_gateway_notice $c, "Dumping debug state on stdout";
+	print Dumper({ "connected" => $connected,
+		       "self_id", => $self_id,
+		       "%channels" => \%channels,
+		       "%channels_by_name" => \%channels_by_name,
+		       "users" => \%users,
+		       "users_by_name" => \%users_by_name,
+		       "users_by_dmid" => \%users_by_dmid
+		     });
+    },
+    "debug_dump" => sub {
+	my ($c, $arg) = @_;
+	$config{debug_dump} = $arg ? 1 : 0 if defined $arg;
+	irc_gateway_notice $c, "Protocol debug is " .
+	  ($config{debug_dump} ? "on" : "off");
+    },
     "newgroup" => sub {
 	my ($c, $name) = @_;
 	unless (defined($name)) {
@@ -437,7 +492,7 @@ my %gateway_command = (
     "cat" => sub {
 	my ($c, $fileid) = @_;
 	unless (defined($fileid)) {
-	    irc_gateway_notice $c, "Syntax: catfile <fileid> <filename>";
+	    irc_gateway_notice $c, "Syntax: cat <fileid> <filename>";
 	    return;
 	}
 
@@ -559,8 +614,9 @@ my %irc_command = (
 	    } elsif ($chan->{Members}->{$self_id}) {
 		# Already joined
 	    } elsif ($chan->{Type} eq "G") {
-		irc_send_num $c, 473, ["#$n"],
-		    "<channel> :Cannot join channel (+i)";
+		rtm_apicall "groups.open", { channel => $chan->{Id} };
+		irc_broadcast_join $self_id, $chan->{Id}
+		  if rtm_update_join $self_id, $chan->{Id};
 	    } else {
 		rtm_apicall "channels.join", { channel => $chan->{Id} };
 	    }
@@ -624,8 +680,13 @@ my %irc_command = (
 	    if (not defined($chan)) {
 		irc_send_num $c, 401, ["#$n"], "No such nick/channel";
 	    } elsif ($chan->{Members}->{$self_id}) {
-		my $what = $chan->{Type} eq "C" ? "channels" : "groups";
-		rtm_apicall "$what.leave", { channel => $chan->{Id} };
+		if ($chan->{Type} eq "G") {
+		    rtm_apicall "groups.close", { channel => $chan->{Id} };
+		    irc_broadcast_part $self_id, $chan->{Id}
+		      if rtm_update_part $self_id, $chan->{Id};
+		} else {
+		    rtm_apicall "channels.leave", { channel => $chan->{Id} };
+		}
 	    }
 	}
     },
@@ -735,13 +796,21 @@ my %irc_command = (
 	$name = "*" unless defined($name);
 	irc_send_num $c, 315, [$name], "End of /WHO list";
     },
+    "MOTD" => sub {
+	my $c = shift;
+	irc_send_motd $c;
+    },
     "PRIVMSG" => sub {
 	my ($c, $namelist, $msg) = @_;
 	return unless $c->{Ready};
 	return unless defined($namelist) && defined($msg);
 
-	$msg =~ s/<@([^>]+)>/'<@' . irc_name_to_id($c, $1) . '>'/eg;
-	$msg =~ s/<#([^>]+)>/'<@' . irc_chan_to_id($c, $1) . '>'/eg;
+	$msg =~ s/&/&amp;/g;
+	$msg =~ s/</&lt;/g;
+	$msg =~ s/>/&gt;/g;
+	$msg =~ s/"/&quot;/g;
+	$msg =~ s/&lt;@([^>]+)&gt;/'<@' . irc_name_to_id($c, $1) . '>'/eg;
+	$msg =~ s/&lt;#([^>]+)&gt;/'<#' . irc_chan_to_id($c, $1) . '>'/eg;
 
 	foreach my $name (split(/,/, $namelist)) {
 	    if (irc_eq($name, "X")) {
@@ -839,7 +908,11 @@ sub irc_do_message {
 
 	my $translate = $text;
 	$translate =~ s/<@([^>]+)>/'<@' . irc_id_to_name($c, $1) . '>'/eg;
-	$translate =~ s/<#([^>]+)>/'<@' . irc_id_to_chan($c, $1) . '>'/eg;
+	$translate =~ s/<#([^>]+)>/'<#' . irc_id_to_chan($c, $1) . '>'/eg;
+	$translate =~ s/&lt;/</g;
+	$translate =~ s/&gt;/>/g;
+	$translate =~ s/&quot;/"/g;
+	$translate =~ s/&amp;/&/g;
 
 	for my $line (split(/\n/, $translate)) {
 	    irc_send_from $c, $srcid, ["PRIVMSG", $dstname], "$prefix$line";
@@ -872,7 +945,7 @@ sub irc_topic_change {
 sub irc_ping {
     my $c = shift;
 
-    if (++$c->{PingCount} >= 2) {
+    if (++$c->{PingCount} >= 3) {
 	irc_disconnect $c, "Ping timeout";
 	return;
     }
@@ -884,7 +957,7 @@ sub irc_ping {
 sub irc_line {
     my ($c, $fh, $line, $eol) = @_;
 
-    print "IRC $fh RECV: $line\n";
+    print "IRC $fh RECV: $line\n" if $config{debug_dump};
 
     utf8::decode($line);
 
@@ -963,7 +1036,7 @@ sub rtm_apicall {
     my ($method, $args, $cb) = @_;
     my @encode;
 
-    print "RTM APICALL $method ", Dumper($args);
+    print "RTM APICALL $method ", Dumper($args) if $config{debug_dump};
 
     $args->{token} = $config{slack_token};
 
@@ -991,7 +1064,7 @@ sub rtm_apicall {
 
 	    my $data = decode_json $body;
 
-	    print "RTM REPLY $method ", Dumper($data);
+	    print "RTM REPLY $method ", Dumper($data) if $config{debug_dump};
 
 	    unless ($data->{ok}) {
 		irc_broadcast_notice "API error: $data->{error}";
@@ -1009,7 +1082,7 @@ sub rtm_send {
     my $frame = shift;
 
     $frame->{id} = $rtm_msg_id++;
-    print "RTM SEND: ", Dumper($frame);
+    print "RTM SEND: ", Dumper($frame) if $config{debug_dump};
     $rtm_con->send(encode_json $frame);
 }
 
@@ -1115,6 +1188,9 @@ sub rtm_update_channel {
     # Cross-reference users/channels
     foreach my $u (@{$c->{members}}) {
 	rtm_record_unknown_uid $u;
+	# Filter ourselves out of the membership list if this is a
+	# closed group chat.
+	next if $type eq 'G' && $u eq $self_id && !$c->{is_open};
 	$mhash->{$u} = 1;
 	$users{$u}->{Channels}->{$id} = 1;
     }
@@ -1391,7 +1467,7 @@ sub rtm_start_ws {
     return if defined($rtm_client);
     $rtm_client = AnyEvent::WebSocket::Client->new;
 
-    print "WSS URL: $url\n";
+    print "WSS URL: $url\n" if $config{debug_dump};
     $rtm_client->connect($url)->cb(sub {
 	$rtm_con = eval { shift->recv; };
 	if ($@) {
@@ -1413,7 +1489,7 @@ sub rtm_start_ws {
 		shift;
 		my $msg = decode_json shift->{body};
 
-		print "RTM RECV: ", Dumper($msg);
+		print "RTM RECV: ", Dumper($msg) if $config{debug_dump};
 		irc_broadcast_notice "RTM error: $msg->{error}->{msg}"
 		    if $msg->{error};
 
