@@ -38,6 +38,9 @@
 #   some IRC clients
 # - Added X commands for debug dumps and dynamically switching protocol
 #   debug on/off
+#
+# Updated 2019-05-08 based on changes from Neia Finch to improve
+# support for bots.
 
 use strict;
 use warnings;
@@ -53,7 +56,7 @@ use Time::localtime;
 use Digest::SHA qw(sha256);
 use JSON;
 
-my $VERSION = "20190225";
+my $VERSION = "20190508";
 my $start_time = time();
 my %config;
 
@@ -122,7 +125,7 @@ sub irc_pick_name {
     for (;;) {
 	my $prop = "$name$i";
 
-	return $prop unless !defined($hash->{irc_lcase($prop)});
+	return $prop unless defined($hash->{irc_lcase($prop)});
 	$i++;
     }
 }
@@ -1124,13 +1127,13 @@ sub rtm_update_user {
 	delete $users_by_name{irc_lcase($oldname)};
 	my $newname = irc_pick_name($c->{name}, \%users_by_name);
 
-	$user->{Realname} = $c->{real_name};
+	$user->{Realname} = $c->{real_name} // $c->{name};
 
 	irc_broadcast_nick $c->{id}, $newname
 	    if $oldname ne $newname;
 
 	$user->{Name} = $newname;
-	$user->{Presence} = $c->{presence} || 'active';
+	$user->{Presence} = $c->{presence} // 'active';
 	$users_by_name{$newname} = $user;
     } else {
 	my $name = irc_pick_name($c->{name}, \%users_by_name);
@@ -1138,9 +1141,9 @@ sub rtm_update_user {
 	    Id => $c->{id},
 	    Name => $name,
 	    Channels => {},
-	    Realname => $c->{real_name},
+	    Realname => $c->{real_name} // $c->{name},
 	    TxQueue => [],
-	    Presence => $c->{presence} || 'active'
+	    Presence => $c->{presence} // 'active'
 	};
 
 	$users{$c->{id}} = $user;
@@ -1350,10 +1353,17 @@ my %rtm_command = (
 	my $msg = shift;
 	my $chan = $channels{$msg->{channel}};
 	my $subtype = $msg->{subtype} || "";
-	my $uid = $msg->{user} || $msg->{comment}->{user};
-	my $text = $msg->{text};
+	my $uid = $msg->{user} || $msg->{comment}->{user} || $msg->{bot_id};
+	my $text = $msg->{text} // '';
 
-	$text = "" unless defined($text);
+	if (defined($msg->{attachments})) {
+	    my $attext = join '\n', map {
+		($_->{title} or "")
+		  . " " . ($_->{text} or "")
+		  . " " . ($_->{title_link} or "") } @{$msg->{attachments}};
+	    $text .= "\n" unless length($text);
+	    $text .= $attext;
+	}
 
 	if (defined($chan)) {
 	    if ($subtype eq "channel_topic" or $subtype eq "group_topic") {
@@ -1543,6 +1553,11 @@ sub rtm_start {
 
 	foreach my $c (@{$data->{channels}}) {
 	    rtm_update_channel "C", $c unless $c->{is_archived};
+	}
+
+	foreach my $c (@{$data->{bots}}) {
+	    rtm_update_user $c;
+	    my $n = $c->{id};
 	}
 
 	foreach my $c (@{$data->{groups}}) {
