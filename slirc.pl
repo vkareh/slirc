@@ -56,7 +56,7 @@ use Time::localtime;
 use Digest::SHA qw(sha256);
 use JSON;
 
-my $VERSION = "20190508";
+my $VERSION = "20190710";
 my $start_time = time();
 my %config;
 
@@ -375,7 +375,7 @@ sub irc_send_who {
 
     my $user = $users{$u};
     my $nick = $u eq $self_id ? $c->{Nick} : $user->{Name};
-    my $here = $user->{Presence} eq 'away' ? 'G' : 'H';
+    my $here = $user->{Presence} && $user->{Presence} eq 'away' ? 'G' : 'H';
 
     irc_send_num $c, 352, [$chname, $user->{Id}, "localhost", "localhost",
 			   $nick, $here], "0 $user->{Realname}";
@@ -1211,12 +1211,32 @@ sub rtm_update_channel {
 	    Name => $name,
 	    Type => $type,
 	    Topic => $c->{topic}->{value}
+	    # LastRead => $c->{last_read}
 	};
 
 	$channels{$c->{id}} = $chan;
 	$channels_by_name{irc_lcase($name)} = $chan;
     }
 }
+
+#sub rtm_populate_history {
+#    my $c = shift;
+#    if ($c->{LastRead}) {
+#	my $endpoint = $c->{Type} eq 'G' ? 'groups.history' : 'channels.history';
+#	print("getting $endpoint for $c->{Name}\n");
+#	rtm_apicall $endpoint, {
+#	    channel => $c->{Id},
+#	    oldest => $c->{LastRead}
+#	}, sub {
+#	    my $history = shift;
+#	    foreach my $message (@{$history->{messages}}) {
+#		if ($message->{type} == 'message') {
+#		    print("$c->{name} history: $message->{user} said $message->{text} on $message->{ts}\n");
+#		}
+#	    }
+#	}
+#    }
+#}
 
 sub rtm_delete_channel {
     my $chid = shift;
@@ -1540,31 +1560,44 @@ sub rtm_start {
 
 	$self_id = $data->{self}->{id};
 
-	foreach my $c (@{$data->{users}}) {
-	    rtm_update_user $c;
+	rtm_apicall "users.list", {}, sub {
+	    my $userList = shift;
+
+	    return unless defined $userList;
+
+	    foreach my $c (@{$userList->{members}}) {
+		rtm_update_user $c unless $c->{deleted};
+	    }
+
+	    foreach my $c (@{$data->{ims}}) {
+		my $u = $users{$c->{user}};
+
+		$u->{DMId} = $c->{id};
+		$users_by_dmid{$c->{id}} = $u;
+	    }
+
+	    foreach my $c (@{$data->{channels}}) {
+	    	if ($c->{is_member} && !$c->{is_archived}) {
+		    rtm_apicall "channels.info", { channel => $c->{id} }, sub {
+			my $channelInfo = shift;
+			my $channel = $channelInfo->{channel};
+			return unless defined $channel;
+			rtm_update_channel "C", $channel;
+		    }
+		}
+	    }
+
+	    foreach my $c (@{$data->{bots}}) {
+		rtm_update_user $c unless $c->{deleted};
+		my $n = $c->{id};
+	    }
+
+	    foreach my $c (@{$data->{groups}}) {
+		rtm_update_channel "G", $c unless $c->{is_archived};
+	    }
+
+	    rtm_start_ws $data->{url};
 	}
-
-	foreach my $c (@{$data->{ims}}) {
-	    my $u = $users{$c->{user}};
-
-	    $u->{DMId} = $c->{id};
-	    $users_by_dmid{$c->{id}} = $u;
-	}
-
-	foreach my $c (@{$data->{channels}}) {
-	    rtm_update_channel "C", $c unless $c->{is_archived};
-	}
-
-	foreach my $c (@{$data->{bots}}) {
-	    rtm_update_user $c;
-	    my $n = $c->{id};
-	}
-
-	foreach my $c (@{$data->{groups}}) {
-	    rtm_update_channel "G", $c unless $c->{is_archived};
-	}
-
-	rtm_start_ws $data->{url};
     };
 };
 
