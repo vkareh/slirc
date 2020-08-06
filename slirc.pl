@@ -55,8 +55,9 @@ use Data::Dumper;
 use Time::localtime;
 use Digest::SHA qw(sha256);
 use JSON;
+use Storable qw(dclone);
 
-my $VERSION = "20190710";
+my $VERSION = "20200806";
 my $start_time = time();
 my %config;
 
@@ -830,9 +831,24 @@ my %irc_command = (
 		my $chan = $channels_by_name{irc_lcase($1)};
 
 		if (defined $chan) {
-		    rtm_send {
-			type => "message", channel => $chan->{Id},
-			text => $msg };
+		    # Thread channels have the form #channel_name^thread_ts
+		    if (index($chan->{Name}, "^")) {
+			# Split channel name and thread_ts so that we can reply to it from IRC
+			my @args = split(/\^/, $chan->{Name});
+			my $channel_name = shift @args;
+			my $thread = shift @args;
+			# Get parent channel, since that's what the Slack API expects
+			# then add the thread_ts. Slack knows how to join them together
+			my $parent = $channels_by_name{irc_lcase($channel_name)};
+			rtm_send {
+			    type => "message", channel => $parent->{Id},
+			    thread_ts => $thread,
+			    text => $msg };
+		    } else {
+			rtm_send {
+			    type => "message", channel => $chan->{Id},
+			    text => $msg };
+		    }
 		} else {
 		    irc_send_num $c, 401, [$name], "No such nick/channel";
 		}
@@ -842,7 +858,18 @@ my %irc_command = (
 		my $user = $users_by_name{irc_lcase($name)};
 
 		if (defined $user) {
-		    rtm_send_to_user $user->{Id}, $msg;
+		    # Thread users have the form user_name^thread_ts
+		    if (index($user->{Name}, "^")) {
+			# Split username and thread_ts so that we can reply to it from IRC
+			my @args = split(/\^/, $user->{Name});
+			my $user_name = shift @args;
+			my $thread = shift @args;
+			# Get correct user then add the thread_ts. Slack knows how to join them together
+			my $parent = $users_by_name{irc_lcase($user_name)};
+			rtm_send_to_user $user->{Id}, $msg, $thread;
+		    } else {
+			rtm_send_to_user $user->{Id}, $msg;
+		    }
 		} else {
 		    irc_send_num $c, 401, [$name], "No such nick/channel";
 		}
@@ -928,9 +955,53 @@ sub irc_privmsg {
     irc_do_message $id, $users{$id}->{Name}, $subtype, $msg;
 }
 
+# Create a new fake user for direct user threads
+sub irc_privthreadmsg_new {
+    my ($id, $subtype, $thread, $msg) = @_;
+    my $tid = "${id}-${thread}";
+    return if defined($users{$tid});
+    # Clone the user and append the thread_ts to the name
+    $users{$tid} = dclone $users{$id};
+    $users{$tid}->{Name} = "$users{$id}->{Name}^${thread}";
+    $users_by_name{irc_lcase($users{$tid}->{Name})} = $users{$tid};
+    # Send a direct message to the new fake user
+    irc_do_message $tid, "$users{$tid}->{Name}", $subtype, $msg;
+}
+
+# Send direct message to a user thread
+sub irc_privthreadmsg {
+    my ($id, $subtype, $thread, $msg) = @_;
+    my $tid = "${id}-${thread}";
+    return unless defined($users{$tid});
+    irc_do_message $tid, "$users{$tid}->{Name}", $subtype, $msg;
+}
+
 sub irc_chanmsg {
     my ($id, $subtype, $chid, $msg) = @_;
     irc_do_message $id, "#$channels{$chid}->{Name}", $subtype, $msg;
+}
+
+# Create a new channel for each new thread
+sub irc_chanthreadmsg_new {
+    my ($id, $subtype, $chid, $thread, $msg) = @_;
+    my $tid = "${chid}-${thread}";
+    return if defined($channels{$tid});
+    # Clone the parent channel and append the thread_ts to the name
+    $channels{$tid} = dclone $channels{$chid};
+    $channels{$tid}->{Name} = "$channels{$chid}->{Name}^${thread}";
+    $channels_by_name{irc_lcase($channels{$tid}->{Name})} = $channels{$tid};
+    # Join the channel and open by displaying the first comment in the thread
+    irc_broadcast_join $self_id, $tid;
+    irc_do_message $id, "#$channels{$tid}->{Name}", $subtype, $msg;
+}
+
+# Post message to a specific thread
+sub irc_chanthreadmsg {
+    my ($id, $subtype, $chid, $thread, $msg) = @_;
+    my $tid = "${chid}-${thread}";
+    # If the thread channel does not exist, it's because we're not in the reply_users list
+    return unless defined($channels{$tid});
+    irc_do_message $id, "#$channels{$tid}->{Name}", $subtype, $msg;
 }
 
 sub irc_topic_change {
@@ -1373,8 +1444,9 @@ my %rtm_command = (
 	my $msg = shift;
 	my $chan = $channels{$msg->{channel}};
 	my $subtype = $msg->{subtype} || "";
-	my $uid = $msg->{user} || $msg->{comment}->{user} || $msg->{bot_id};
-	my $text = $msg->{text} // '';
+	my $uid = $msg->{user} || $msg->{comment}->{user} || $msg->{message}->{user} || $msg->{bot_id};
+	my $text = $msg->{text} || $msg->{message}->{text} // '';
+	my $thread = $msg->{thread_ts} || $msg->{message}->{thread_ts};
 
 	if (defined($msg->{attachments})) {
 	    my $attext = join '\n', map {
@@ -1389,12 +1461,33 @@ my %rtm_command = (
 	    if ($subtype eq "channel_topic" or $subtype eq "group_topic") {
 		$chan->{Topic} = $msg->{topic};
 		irc_topic_change $uid, $chan->{Id};
+	    } elsif ($subtype eq "message_replied") {
+		# Verify that the user is part of this thread
+		if ($self_id ~~ $msg->{message}->{reply_users}) {
+		    # When getting a thread reply there are two messages: the parent thread message and the latest message.
+		    # We generate a thread channel with the first message so that we can post new messages to it
+		    irc_chanthreadmsg_new $uid, $msg->{message}->{subtype}, $chan->{Id}, $thread, $text;
+		}
+	    } elsif (defined($thread)) {
+		# Post message to thread
+		irc_chanthreadmsg $uid, $msg->{subtype}, $chan->{Id}, $thread, $text;
 	    } else {
+		# Post message to channel
 		irc_chanmsg $uid, $msg->{subtype}, $chan->{Id}, $text;
 	    }
 	    rtm_mark_channel $chan->{Id}, $msg->{ts};
 	} else {
-	    irc_privmsg $uid, $msg->{subtype}, $text;
+	    if ($subtype eq "message_replied") {
+		# When getting a thread reply there are two messages: the parent thread message and the latest message.
+		# We generate a new fake user for the thread with the first message so that we can post new messages to it
+		irc_privthreadmsg_new $uid, $msg->{message}->{subtype}, $thread, $text;
+	    } elsif (defined($thread)) {
+		# Send direct message to fake thread user
+		irc_privthreadmsg $uid, $msg->{subtype}, $thread, $text;
+	    } else {
+		# Send direct message to user
+		irc_privmsg $uid, $msg->{subtype}, $text;
+	    }
 	}
 
 	if ($subtype eq "file_share") {
@@ -1408,6 +1501,8 @@ my %rtm_command = (
 
 		if (defined $chan) {
 		    irc_chanmsg $uid, ">$fid", $chan->{Id}, $body;
+		} elsif (defined($thread)) {
+		    irc_privthreadmsg $uid, ">$fid", $thread, $body;
 		} else {
 		    irc_privmsg $uid, ">$fid", $body;
 		}
@@ -1417,12 +1512,18 @@ my %rtm_command = (
 );
 
 sub rtm_send_to_user {
-    my ($id, $msg) = @_;
+    my ($id, $msg, $thread) = @_;
     my $u = $users{$id};
 
     if (defined($u->{DMId}) && length($u->{DMId})) {
-	rtm_send { type => "message",
-		channel => $u->{DMId}, text => $msg };
+	if (defined($thread)) {
+	    # Add thread_ts to message payload to ensure it's part of the correct thread
+	    rtm_send { type => "message",
+		    channel => $u->{DMId}, thread_ts => $thread, text => $msg };
+	} else {
+	    rtm_send { type => "message",
+		    channel => $u->{DMId}, text => $msg };
+	    }
 	return;
     }
 
