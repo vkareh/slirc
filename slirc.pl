@@ -57,7 +57,7 @@ use Digest::SHA qw(sha256);
 use JSON;
 use Storable qw(dclone);
 
-my $VERSION = "20200806";
+my $VERSION = "20200810";
 my $start_time = time();
 my %config;
 
@@ -928,7 +928,6 @@ sub irc_chan_to_id {
 sub irc_do_message {
     my ($srcid, $dstname, $subtype, $text) = @_;
 
-    $text =~ s/\002//g;
     my $prefix = "";
     $prefix = "\002[$subtype]\002 " if defined($subtype);
 
@@ -1102,6 +1101,7 @@ my $rtm_cooldown_timer;
 
 my %rtm_mark_queue;
 my $rtm_mark_timer;
+my $rtm_history_timer;
 
 my $rtm_ping_timer;
 my $rtm_ping_count;
@@ -1281,8 +1281,8 @@ sub rtm_update_channel {
 	    Members => $mhash,
 	    Name => $name,
 	    Type => $type,
-	    Topic => $c->{topic}->{value}
-	    # LastRead => $c->{last_read}
+	    Topic => $c->{topic}->{value},
+	    LastRead => $c->{last_read}
 	};
 
 	$channels{$c->{id}} = $chan;
@@ -1290,24 +1290,7 @@ sub rtm_update_channel {
     }
 }
 
-#sub rtm_populate_history {
-#    my $c = shift;
-#    if ($c->{LastRead}) {
-#	my $endpoint = $c->{Type} eq 'G' ? 'groups.history' : 'channels.history';
-#	print("getting $endpoint for $c->{Name}\n");
-#	rtm_apicall $endpoint, {
-#	    channel => $c->{Id},
-#	    oldest => $c->{LastRead}
-#	}, sub {
-#	    my $history = shift;
-#	    foreach my $message (@{$history->{messages}}) {
-#		if ($message->{type} == 'message') {
-#		    print("$c->{name} history: $message->{user} said $message->{text} on $message->{ts}\n");
-#		}
-#	    }
-#	}
-#    }
-#}
+sub rtm_populate_history;
 
 sub rtm_delete_channel {
     my $chid = shift;
@@ -1344,6 +1327,14 @@ sub rtm_mark_channel {
 }
 
 my %rtm_command = (
+    "hello" => sub {
+	# After connecting, wait a few seconds for IRC to start listening
+	$rtm_history_timer = AnyEvent->timer(after => 15, cb => sub {
+	    undef $rtm_history_timer;
+	    # Populate message history
+	    rtm_populate_history;
+	});
+    },
     "presence_change" => sub {
 	my $msg = shift;
 	my $user = $users{$msg->{user}};
@@ -1510,6 +1501,28 @@ my %rtm_command = (
 	}
     },
 );
+
+sub rtm_populate_history {
+    foreach my $chid (keys %channels) {
+	my $c = $channels{$chid};
+	rtm_apicall "conversations.history", { channel => $c->{Id}, oldest => $c->{LastRead} }, sub {
+	    my $history = shift;
+	    my @messages = sort { $a->{ts} <=> $b->{ts} } @{$history->{messages}};
+	    foreach my $message (@messages) {
+		if ($message->{type} eq 'message') {
+		    $message->{channel} = $c->{Id};
+		    # This prepends a date marker on the message text
+		    if (defined($message->{text})) {
+			my $ts = ctime($message->{ts});
+			$message->{text} = "\002[$ts]\002 $message->{text}";
+		    }
+		    my $handler = $rtm_command{message};
+		    $handler->($message) if defined($handler);
+		}
+	    }
+	}
+    }
+}
 
 sub rtm_send_to_user {
     my ($id, $msg, $thread) = @_;
